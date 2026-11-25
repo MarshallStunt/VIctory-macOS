@@ -208,33 +208,69 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    // Held throughout: a heap is not dropped while its slots are made.
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    for &(start, _, at) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
-            continue;
-        };
-        let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
-            // By page: one with nothing mapped (the title unmaps heap pages
-            // too) holds no records.
-            let page_size = crate::watch::PAGE;
+    /// A heap's start, its address, and the ranges written since the last sync.
+    type Written = (u64, usize, Vec<(usize, usize)>);
+    // The written ranges of every heap, taken in one short hold of the lock.
+    let work: Vec<Written> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            .filter_map(|&(start, _, at)| {
+                // SAFETY: registered heaps are live (removed when dropped).
+                let heap = unsafe { &*(at as *const Heap) };
+                // As before: ranges are taken only once the heap has its
+                // host heap, so writes before that are not lost.
+                let (Some(Some(_)), Some(written), Some(_)) =
+                    (heap.host.get(), &heap.written, increment(heap.desc.kind))
+                else {
+                    return None;
+                };
+                Some((start, at, written.take(start as usize, usize::MAX)))
+            })
+            .collect()
+    };
+    // Then page by page, the lock held for one page at a time: title
+    // threads writing views (`mirror`) wait on it, and held across every
+    // page of every heap they waited ~100 ms a frame in the world (some
+    // 650,000 slots checked a frame, 29 submissions). A heap is not dropped
+    // while its page is made: `Heap::drop` takes the same lock to leave the
+    // list, so a heap still listed under the lock is alive.
+    let page_size = crate::watch::PAGE;
+    for (start, at, ranges) in work {
+        for (from, to) in ranges {
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
+                let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+                if !heaps.iter().any(|&(s, _, h)| (s, h) == (start, at)) {
+                    break;
+                }
+                // SAFETY: listed under the lock we hold, so not yet dropped.
+                let heap = unsafe { &*(at as *const Heap) };
+                let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind))
+                else {
+                    break;
+                };
+                let step = u64::from(step);
                 let (page, end) = (page.max(from), (page + page_size).min(to));
+                // By page: one with nothing mapped (the title unmaps heap
+                // pages too) holds no records.
                 if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                let (first, last) = (
+                    (page as u64 - start) / step,
+                    (end as u64 - start).div_ceil(step),
+                );
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                host.sync_slots(
+                    first as u32,
+                    last.min(u64::from(heap.desc.count)) as u32,
+                    start,
+                    step,
+                );
             }
         }
     }

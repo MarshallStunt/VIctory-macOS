@@ -550,6 +550,17 @@ pub fn patch(base: u64, info: &ImageInfo, file: &[u8], wanted: &Wanted) -> usize
     patched
 }
 
+/// What to patch, from `VICTORY_PATCH_MASKED`: its value (`all` or hex
+/// RVAs, for [`wanted_from`]), nothing for `none`, and `all` when it is
+/// unset and `needed` (fault tracking under Rosetta).
+pub fn choice(value: Option<String>, needed: bool) -> Option<String> {
+    match value.as_deref() {
+        Some("none") => None,
+        Some(_) => value,
+        None => needed.then(|| "all".to_owned()),
+    }
+}
+
 /// The stores `VICTORY_PATCH_MASKED` asks to patch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Wanted {
@@ -680,6 +691,16 @@ mod patch_tests {
                 rvas: vec![0x1e09b31, 0x1e09b37]
             }
         );
+    }
+
+    #[test]
+    fn stores_are_patched_by_default_only_when_needed() {
+        let s = |v: &str| Some(v.to_owned());
+        assert_eq!(choice(None, true), s("all"));
+        assert_eq!(choice(None, false), None);
+        assert_eq!(choice(s("none"), true), None);
+        assert_eq!(choice(s("1e09b31"), true), s("1e09b31"));
+        assert_eq!(choice(s("all"), false), s("all"));
     }
 
     /// Real code with a masked store, run as written and then patched:

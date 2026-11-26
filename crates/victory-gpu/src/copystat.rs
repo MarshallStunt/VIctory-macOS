@@ -136,20 +136,76 @@ pub(crate) fn mode() -> u8 {
     })
 }
 
-/// Per source range (start, length): copies, bytes, microseconds, memory type.
-type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
-static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
+/// One counted copy, a note of it: its source range's start and length,
+/// its microseconds, its memory kind. A refresh batch appends one per
+/// copy; the dump sums the notes into one entry per source range.
+type Note = (usize, usize, u64, u32);
 
-/// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
-pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
-    let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map
-        .get_or_insert_with(HashMap::new)
-        .entry((src, len))
-        .or_insert((0, 0, 0, kind));
-    e.0 += 1;
-    e.1 += len as u64;
-    e.2 += us;
+/// Per source range (start, length): copies, bytes, microseconds, memory
+/// type — what the dump sums a period of notes into.
+type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
+
+/// How many note lists there are. Each new thread that copies takes the
+/// next in turn; with more threads copying at once than this, two share
+/// one, and wait on each other no more than they did on the one map.
+const SHARDS: usize = 16;
+static NOTES: [Mutex<Option<Vec<Note>>>; SHARDS] = [const { Mutex::new(None) }; SHARDS];
+
+thread_local! {
+    /// This thread's note list, as an index into `NOTES`.
+    static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// This thread's note list, the next of `NOTES` for a new thread.
+fn mine() -> usize {
+    MINE.with(|mine| {
+        let mut at = mine.get();
+        if at == usize::MAX {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            at = NEXT.fetch_add(1, Relaxed) as usize % SHARDS;
+            mine.set(at);
+        }
+        at
+    })
+}
+
+/// A refresh batch's note list, held across its copies: each copy of the
+/// batch appends its note without taking the lock again — and without
+/// the per-copy map visit the summed map charged every copy.
+pub(crate) struct Counted(std::sync::MutexGuard<'static, Option<Vec<Note>>>);
+
+/// Takes this thread's note list for a batch of copies.
+pub(crate) fn hold() -> Counted {
+    Counted(NOTES[mine()].lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+impl Counted {
+    /// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
+    pub(crate) fn range(&mut self, src: usize, len: usize, us: u64, kind: u32) {
+        self.0.get_or_insert_with(Vec::new).push((src, len, us, kind));
+    }
+}
+
+/// Takes every thread's note list, summed: one entry per source range.
+/// The lists come out of their locks before summing, so a dump never
+/// makes a copy wait while it sums.
+fn merged() -> Ranges {
+    let mut taken: Vec<Vec<Note>> = Vec::with_capacity(SHARDS);
+    for notes in NOTES.iter() {
+        if let Some(notes) = notes.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            taken.push(notes);
+        }
+    }
+    let mut all: Ranges = HashMap::new();
+    for notes in taken {
+        for (src, len, us, kind) in notes {
+            let e = all.entry((src, len)).or_insert((0, 0, 0, kind));
+            e.0 += 1;
+            e.1 += len as u64;
+            e.2 += us;
+        }
+    }
+    all
 }
 
 /// Snapshot bytes per host copy (its title start and length).
@@ -349,8 +405,7 @@ pub(crate) fn log(frames: f64) {
         .map(|((start, len), bytes)| format!("{start:#x}+{len:#x} {:.1} MB", *bytes as f64 / 1e6 / frames))
         .collect();
     tracing::info!("  snapshots per frame by copy: {}", snapshots.join(", "));
-    let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
+    let mut ranges: Vec<_> = merged().into_iter().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
     for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
@@ -415,6 +470,193 @@ fn note_large(size: usize) {
         tracing::info!(mb = size >> 20, "a large heap allocation (first of its size class): {}", frames.join(" | "));
     }
     INSIDE.with(|i| i.set(false));
+}
+
+/// The tests and the bench share the note lists: one at a time.
+#[cfg(test)]
+static SEQUENTIAL: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A batch counts into its thread's list, and the dump takes every
+    /// batch's counts as one entry per range. The holds end before the
+    /// dump takes the lists: it takes this thread's too.
+    #[test]
+    fn batches_count_into_one_dump() {
+        let _one = SEQUENTIAL.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut counted = hold();
+            counted.range(0x5100_0000_0000, 0x100, 3, 0);
+            counted.range(0x5100_0000_0000, 0x100, 4, 0);
+            counted.range(0x5100_0000_1000, 0x40, 5, 7);
+        }
+        {
+            let mut counted = hold();
+            counted.range(0x5100_0000_1000, 0x40, 6, 7);
+        }
+        let mut all = merged();
+        assert_eq!(all.remove(&(0x5100_0000_0000, 0x100)), Some((2, 0x200, 7, 0)));
+        assert_eq!(all.remove(&(0x5100_0000_1000, 0x40)), Some((2, 0x80, 11, 7)));
+        assert!(!merged().contains_key(&(0x5100_0000_0000, 0x100)), "the dump took the lists");
+    }
+
+    /// Threads count into their own lists, and the dump sums them.
+    #[test]
+    fn threads_count_into_one_dump() {
+        let _one = SEQUENTIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::scope(|scope| {
+            for t in 0..4usize {
+                scope.spawn(move || {
+                    let mut counted = hold();
+                    for _ in 0..250 {
+                        counted.range(0x5200_0000_0000 + t * 0x1000, 0x100, 3, 0);
+                    }
+                });
+            }
+        });
+        let mut all = merged();
+        for t in 0..4usize {
+            assert_eq!(
+                all.remove(&(0x5200_0000_0000 + t * 0x1000, 0x100)),
+                Some((250, 250 * 0x100, 750, 0))
+            );
+        }
+        assert!(!merged().contains_key(&(0x5200_0000_0000, 0x100)), "the dump took the lists");
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// A refresh frame: 123,000 refreshed ranges, evict3's count, over
+    /// eight submissions' batches.
+    const REFRESHES: usize = 123_000;
+    const BATCHES: usize = 8;
+    /// Iterations per scenario; the median is reported.
+    const ITERATIONS: u32 = 5;
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    /// The `refreshes` a frame does: `repeated` ranges recopied each
+    /// submission (few distinct keys), the rest per-draw scratch (nearly
+    /// every call its own key). One pair per call.
+    fn mix(lcg: &mut Lcg, repeated: usize, i: usize) -> (usize, usize) {
+        if i % 8 < 4 {
+            // A streaming buffer's range, recopied: few distinct keys.
+            let src = ((lcg.next() as usize) % repeated.max(1)) << 16;
+            let len = 64 << 10;
+            (src, len)
+        } else {
+            // Per-draw scratch: nearly every call its own key.
+            let src = 0x10_0000_0000 + (((lcg.next() as usize) % 0x1000_0000) << 12);
+            let len = (((lcg.next() % 64) + 4) << 10) as usize;
+            (src, len)
+        }
+    }
+
+    /// Counts a frame's refreshes as `flush` does: one held map per
+    /// submission batch.
+    fn frame(repeated: usize, lcg: &mut Lcg) {
+        for _ in 0..BATCHES {
+            let mut counted = hold();
+            for i in 0..REFRESHES / BATCHES {
+                let (src, len) = mix(lcg, repeated, i);
+                counted.range(src, len, 7, 0);
+            }
+        }
+    }
+
+    /// Empties the note lists between scenarios.
+    fn reset() {
+        for notes in NOTES.iter() {
+            *notes.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    fn one_thread(repeated: usize, label: &str) {
+        let mut times = Vec::new();
+        for _ in 0..ITERATIONS {
+            let mut lcg = Lcg(0x9e3779b97f4a7c15);
+            let started = std::time::Instant::now();
+            frame(repeated, &mut lcg);
+            times.push(started.elapsed().as_micros() as f64);
+            reset();
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = times[times.len() / 2];
+        println!(
+            "{label}: {median:.0} us per {REFRESHES} refreshed ranges ({:.1} ns each, median of {ITERATIONS})",
+            median * 1000.0 / REFRESHES as f64
+        );
+    }
+
+    fn four_threads(repeated: usize, label: &str) {
+        let mut times = Vec::new();
+        for _ in 0..ITERATIONS {
+            let took: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+            let ready = std::sync::Barrier::new(5);
+            std::thread::scope(|scope| {
+                for t in 0..4 {
+                    let (t, ready, took) = (t, &ready, &took);
+                    scope.spawn(move || {
+                        let mut lcg = Lcg(0x9e3779b97f4a7c15 ^ ((t as u64 + 1) * 0x1234));
+                        ready.wait();
+                        let began = std::time::Instant::now();
+                        frame(repeated, &mut lcg);
+                        took[t].store(began.elapsed().as_micros() as u64, Relaxed);
+                    });
+                }
+                ready.wait();
+            });
+            let wall = took.iter().map(|a| a.load(Relaxed)).max().unwrap_or(0);
+            times.push(wall as f64);
+            reset();
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = times[times.len() / 2];
+        println!(
+            "{label}: {median:.0} us wall per {REFRESHES} refreshed ranges ({:.1} ns each, median of {ITERATIONS})",
+            median * 1000.0 / REFRESHES as f64
+        );
+    }
+
+    /// What a dump pays to take and sum a frame's notes, once per
+    /// frame-rate line.
+    fn dump(label: &str) {
+        let mut lcg = Lcg(0x9e3779b97f4a7c15);
+        frame(REFRESHES, &mut lcg);
+        let started = std::time::Instant::now();
+        let merged = merged();
+        let took = started.elapsed().as_micros();
+        println!("{label}: {took} us for {} ranges", merged.len());
+        reset();
+    }
+
+    /// Times the counter path as the diagnostics builds pay it: run with
+    /// `--ignored --nocapture`, under Wine as the port runs.
+    #[test]
+    #[ignore]
+    fn bench_range() {
+        let _one = SEQUENTIAL.lock().unwrap_or_else(|e| e.into_inner());
+        one_thread(2048, "one thread, repeated ranges");
+        one_thread(REFRESHES, "one thread, scattered ranges");
+        four_threads(2048, "four threads, repeated ranges");
+        four_threads(REFRESHES, "four threads, scattered ranges");
+        dump("dump: sum of a frame's scattered notes");
+    }
 }
 
 // SAFETY: every call goes to the system allocator unchanged; only counted.
@@ -496,7 +738,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
 }
 
 #[cfg(test)]
-mod tests {
+mod alloc_tests {
     use super::{BIG, C, COUNT, CountingAlloc, Relaxed};
     use std::alloc::{GlobalAlloc, Layout};
 

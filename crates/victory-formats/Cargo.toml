@@ -17,3 +17,7 @@ workspace = true
 [[bench]]
 name = "table_runs"
 harness = false
+
+[[bench]]
+name = "title_copies"
+harness = false

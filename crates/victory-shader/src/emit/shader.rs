@@ -20,7 +20,8 @@ pub const VIEW_STRIDES: u8 = 255;
 /// The bits of a view-stride table dword holding the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a view-stride table dword: a typed buffer view of an integer format
-/// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
+/// (`UINT` or `SINT`), whose 32-bit accesses use the `.i32` overloads and whose
+/// 16-bit typed accesses (`_d16`) pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;

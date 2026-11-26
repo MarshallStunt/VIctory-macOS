@@ -2,7 +2,9 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it; a wave64 one on a
+//! host of 32-lane waves declares 32 and runs in halves
+//! ([`Options::host_wave32`]).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -58,9 +60,11 @@
 //! * **Buffer views in the heap** are declared by how the shader reads
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
 //!   typed-format loads without an index; structured with the used-resource
-//!   entry's stride when indexed; typed with four 32-bit float channels for
-//!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
-//!   that index must be of that kind and start at the console descriptor's
+//!   entry's stride when indexed; typed with four 32-bit channels for
+//!   `buffer_load_format_*` and `buffer_store_format_*`. A dynamic integer
+//!   view gets a second, integer-annotated handle and guarded `.i32` loads
+//!   and stores; float views keep the `.f32` path. The host's view at that
+//!   index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
 //!   title's view description says. Typed-format loads from heap
 //!   descriptors (1,024 world compute programs, ray-tracing material
@@ -213,10 +217,13 @@ mod container;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
+#[cfg(all(test, windows))]
+mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
 mod rect;
+pub use container::sign as sign_container;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
@@ -228,6 +235,8 @@ mod shader;
 mod stride_tests;
 #[cfg(all(test, windows))]
 mod synthetic_tests;
+#[cfg(test)]
+mod typed_buffer_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -242,9 +251,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    ATOMIC_LOCKS, ATOMIC_LOCKS_AT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED,
-    VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, VIEW_WRITES_BYTES,
+    ATOMIC_LOCKS, ATOMIC_LOCKS_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW,
+    ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
+    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    VIEW_WRITES_BYTES,
 };
 
 /// The loop limit without an override: 2^14.
@@ -390,6 +400,12 @@ pub struct Options {
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
     pub bias_as_gradients: bool,
+    /// The host's waves have at most 32 lanes (`WaveLaneCountMax` 32:
+    /// NVIDIA, Intel), so it refuses `WaveSize(64)`: a console wave64
+    /// compute program that needs the console's lanes runs as two waves of
+    /// 32, and is refused where it reads across them (`lower::halves`).
+    /// The translation differs, so the shader cache keys on it.
+    pub host_wave32: bool,
     /// The host runs wave64 programs in 32-lane waves whatever `WaveSize`
     /// says (D3DMetal): a compute group that is one console wave of more
     /// than 32 lanes gets group barriers where its lanes read LDS other
@@ -421,6 +437,28 @@ impl MeshOutputs {
     /// at 128 vertices 17 rows of 59 components draw, 17 of 65 do not.
     pub fn bytes(&self) -> u32 {
         4 * (self.vertex_components * self.vertices + self.primitive_components * self.primitives)
+    }
+
+    /// The outputs of a mesh shader being lowered: its declared counts and
+    /// the components of the signature elements that have a register.
+    pub(crate) fn of(
+        outputs: &[container::SigElement],
+        prims: &[container::SigElement],
+        vertices: u32,
+        primitives: u32,
+    ) -> Self {
+        let components = |els: &[container::SigElement]| {
+            els.iter()
+                .filter(|e| e.row.is_some())
+                .map(|e| u32::from(e.cols))
+                .sum()
+        };
+        MeshOutputs {
+            vertices,
+            primitives,
+            vertex_components: components(outputs),
+            primitive_components: components(prims),
+        }
     }
 }
 
@@ -461,14 +499,16 @@ pub fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
     })
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container, without write marks.
-pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    translate_with(container, Options::default())
+struct Prepared<'a> {
+    c: Container<'a>,
+    native: NativeProgram,
+    p: ir::Program,
+    st: structure::Structured,
+    io: io::Io,
+    res: resource::Resources,
 }
 
-/// [`translate`] made as `options` say.
-pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -492,7 +532,138 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    Ok(Prepared {
+        c,
+        native,
+        p,
+        st,
+        io,
+        res,
+    })
+}
+
+/// Arbitrary (`kind == 0`) input channels read by an emitted pixel shader,
+/// keyed by `(UPPERCASE_NAME, semantic_index)` -> 4-bit absolute channel mask.
+fn pixel_input_reads(dxil: &[u8]) -> Result<lower::KeptOutputs, ShaderError> {
+    let c = Container::parse(dxil)?;
+    let Some(part) = c.part(FourCC::ISG1) else {
+        return Ok(lower::KeptOutputs::new());
+    };
+    let mut reads = lower::KeptOutputs::new();
+    let count = crate::dxbc::u32_at(part.data, 0)? as usize;
+    let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+    for i in 0..count {
+        let at = base + 32 * i;
+        // System value at +12: 0 is arbitrary (non-SV).
+        if crate::dxbc::u32_at(part.data, at + 12)? != 0 {
+            continue;
+        }
+        let name_at = crate::dxbc::u32_at(part.data, at + 4)? as usize;
+        let name = part
+            .data
+            .get(name_at..)
+            .and_then(|s| s.split(|&b| b == 0).next())
+            .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
+        let index = crate::dxbc::u32_at(part.data, at + 8)?;
+        let rw = *part
+            .data
+            .get(at + 25)
+            .ok_or(ShaderError::Malformed("truncated"))?;
+        if rw != 0 {
+            let key = (String::from_utf8_lossy(name).to_ascii_uppercase(), index);
+            *reads.entry(key).or_insert(0) |= rw;
+        }
+    }
+    Ok(reads)
+}
+
+/// Translates the vertex, pixel, compute or mesh program of a console
+/// shader container, without write marks.
+pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with(container, Options::default())
+}
+
+/// [`translate`] made as `options` say.
+pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    let prep = prepare(container)?;
+    emit_pruned(
+        &EmitInput {
+            c: &prep.c,
+            native: &prep.native,
+            p: &prep.p,
+            st: &prep.st,
+            io: &prep.io,
+            res: &prep.res,
+        },
+        options,
+        None,
+    )
+}
+
+/// Re-translates a mesh shader together with its paired pixel shader (or
+/// `None` for depth-only draws), pruning arbitrary mesh outputs the pixel
+/// shader never reads so the mesh shader fits within [`METAL_MESH_OUTPUT_BYTES`]
+/// (32 KiB) while keeping both stages' signatures linked for D3D12.
+pub fn translate_linked(
+    mesh: &[u8],
+    pixel: Option<&[u8]>,
+    options: Options,
+) -> Result<(HostShader, Option<HostShader>), ShaderError> {
+    let mp = prepare(mesh)?;
+    let ms_in = EmitInput {
+        c: &mp.c,
+        native: &mp.native,
+        p: &mp.p,
+        st: &mp.st,
+        io: &mp.io,
+        res: &mp.res,
+    };
+    let emit_mesh = |reads: &lower::KeptOutputs| {
+        let linked = emit_pruned(&ms_in, options, Some(reads))?;
+        let bytes = mesh_outputs(&linked.dxil)
+            .ok_or(ShaderError::Malformed(
+                "linked shader has no mesh output declaration",
+            ))?
+            .bytes();
+        if bytes > METAL_MESH_OUTPUT_BYTES {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "mesh outputs required by the next stage exceed 32 KiB",
+            });
+        }
+        Ok(linked)
+    };
+    let Some(ps_bytes) = pixel else {
+        return Ok((emit_mesh(&lower::KeptOutputs::new())?, None));
+    };
+    let pp = prepare(ps_bytes)?;
+    if pp.native.stage != HwStage::Ps {
+        return Err(ShaderError::Malformed(
+            "mesh output consumer is not a pixel shader",
+        ));
+    }
+    let ps_in = EmitInput {
+        c: &pp.c,
+        native: &pp.native,
+        p: &pp.p,
+        st: &pp.st,
+        io: &pp.io,
+        res: &pp.res,
+    };
+    let full_ps = emit_pruned(&ps_in, options, None)?;
+    let reads = pixel_input_reads(&full_ps.dxil)?;
+    let linked_ms = emit_mesh(&reads)?;
+    let linked_ps = emit_pruned(&ps_in, options, Some(&reads))?;
+    Ok((linked_ms, Some(linked_ps)))
+}
+
+struct EmitInput<'a> {
+    c: &'a Container<'a>,
+    native: &'a NativeProgram,
+    p: &'a ir::Program,
+    st: &'a structure::Structured,
+    io: &'a io::Io,
+    res: &'a resource::Resources,
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -517,6 +688,33 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
+    emit_pruned(
+        &EmitInput {
+            c,
+            native,
+            p,
+            st,
+            io,
+            res,
+        },
+        options,
+        None,
+    )
+}
+
+fn emit_pruned(
+    input: &EmitInput<'_>,
+    options: Options,
+    keep: Option<&lower::KeptOutputs>,
+) -> Result<HostShader, ShaderError> {
+    let EmitInput {
+        c,
+        native,
+        p,
+        st,
+        io,
+        res,
+    } = *input;
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -589,16 +787,17 @@ pub fn emit_with(
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
+        host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_pruned(&parts(st, res), keep) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_pruned(&parts(&st, &res), keep)?
         }
         l => l?,
     };
@@ -742,6 +941,11 @@ mod tests {
     use super::container::SigElement;
     use super::shader::Shader;
     use super::*;
+
+    /// A translated mesh shader's output bytes, as the runtime counts them.
+    fn mesh_bytes(dxil: &[u8]) -> Option<u32> {
+        mesh_outputs(dxil).map(|o| o.bytes())
+    }
     use crate::native::{ComputeIo, StageIo};
 
     #[test]
@@ -1846,28 +2050,33 @@ mod tests {
     /// `PSV0` and signatures, and their size is Metal's count: 4 bytes per
     /// component of each declared vertex and primitive. 17 full rows of
     /// 128 vertices are 34816 bytes; 17 rows of 59 components are under
-    /// the limit. Other stages have none.
+    /// the limit. A shader over the limit has its counts capped at its 32
+    /// lanes, which export one vertex and one primitive each (the last two
+    /// columns). Other stages have none.
     #[test]
     fn mesh_outputs_are_counted_as_metal_counts_them() {
-        for (v, p, vr, pr, bytes) in [
-            (32, 32, 1, 0, 512),
-            (128, 128, 16, 0, METAL_MESH_OUTPUT_BYTES),
-            (128, 128, 17, 0, 34816),
-            (128, 64, 16, 1, 33792),
-            (64, 128, 24, 4, METAL_MESH_OUTPUT_BYTES),
+        for (v, p, vr, pr, ev, ep) in [
+            (32, 32, 1, 0, 32, 32),
+            (128, 128, 16, 0, 128, 128),
+            (128, 128, 17, 0, 32, 32),
+            (128, 64, 16, 1, 32, 32),
+            (64, 128, 24, 4, 64, 128),
         ] {
             let ms = sized_mesh(v, p, vr, pr).unwrap_or_else(|e| panic!("{v} {p} {vr} {pr}: {e}"));
             let o = mesh_outputs(&ms.dxil).expect("a mesh shader's outputs");
             assert_eq!(
                 o,
                 MeshOutputs {
-                    vertices: v,
-                    primitives: p,
+                    vertices: ev,
+                    primitives: ep,
                     vertex_components: 4 * vr,
                     primitive_components: 4 * pr,
                 }
             );
-            assert_eq!(o.bytes(), bytes, "{o:?}");
+            assert_eq!(o.bytes(), 4 * (4 * vr * ev + 4 * pr * ep), "{o:?}");
+            if (ev, ep) == (v, p) {
+                assert!(o.bytes() <= METAL_MESH_OUTPUT_BYTES, "{o:?}");
+            }
         }
         let ms = shaped_mesh(128, 128, &HALF_FILLED, 0).unwrap();
         let o = mesh_outputs(&ms.dxil).unwrap();
@@ -2447,5 +2656,333 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// Builds a synthetic mesh shader declaring `SV_Position` plus 16 `float4`
+    /// `TEXCOORD` outputs (68 components total). At 128 vertices that is
+    /// 34,816 bytes (> 32 KiB DXIL budget).
+    fn wide_mesh_parts(
+        threads: u32,
+        max_vertices: u32,
+        max_primitives: u32,
+    ) -> (Vec<u8>, NativeProgram) {
+        let mut words = vec![
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E10_02FF, // v_mov_b32 v8, 0.25
+            0.25f32.to_bits(),
+            0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
+            TRIANGLE,
+            0x7E14_0280, // v_mov_b32 v10, 0.0
+        ];
+        // param0 = (1.0, 0.5, 0.0, 0.0)
+        words.extend([0xF800_000F | (32 << 4), 0x0A0A_0607]);
+        // param1..14 = (0.0, 0.0, 0.0, 0.0)
+        for k in 1..15u32 {
+            words.extend([0xF800_000F | ((32 + k) << 4), 0x0A0A_0A0A]);
+        }
+        // param15 = (0.0, 0.0, 0.25, 1.0)
+        words.extend([0xF800_000F | ((32 + 15) << 4), 0x0708_0A0A]);
+        words.extend([
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let outputs: Vec<crate::native::VsOutput> = (0..16u8)
+            .map(|k| crate::native::VsOutput {
+                usage: crate::native::Usage::Generic,
+                row: k + 1,
+                param: k,
+                fp16: false,
+                pack2: false,
+            })
+            .collect();
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 12,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs,
+                clip_cntl: 0,
+                threads,
+                max_vertices,
+                max_primitives,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut sig = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        }];
+        for k in 0..16u32 {
+            sig.push(SigElement {
+                name: "TEXCOORD".into(),
+                index: k,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(k + 1),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            });
+        }
+        let osg1 = container::signature(&sig, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        (bytes, native)
+    }
+
+    /// A 64-lane mesh shader whose declared `max_vertices`/`max_primitives`
+    /// (128) would push its 68 output components past 32 KiB tightens those
+    /// maxima down to its thread count (64), fitting in 17,408 bytes and
+    /// passing DXIL validation standalone.
+    #[test]
+    fn mesh_exceeding_32k_tightens_counts_to_group_threads() {
+        let (bytes, native) = wide_mesh_parts(64, 128, 128);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(mesh_bytes(&ms.dxil), Some(68 * 4 * 64));
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut ms.dxil.clone()).unwrap();
+        }
+    }
+
+    /// A 128-lane mesh shader with 68 output components (34,816 B > 32 KiB
+    /// even at one vertex per lane) linked with its pixel shader: pruning
+    /// unread attributes (`TEXCOORD1..14`) and unread leading/trailing channels
+    /// (`TEXCOORD0.zw`, `TEXCOORD15.xy`) brings both stages into matching
+    /// signatures under 32 KiB, passes DXIL validation, and draws the exact
+    /// pixel output on hardware and WARP.
+    #[test]
+    fn linked_mesh_and_pixel_prune_unused_outputs_under_32k_and_draw() {
+        let (ms_bytes, ms_native) = wide_mesh_parts(128, 128, 128);
+        let mc = Container::parse(&ms_bytes).unwrap();
+        let mp = ir::build(&ms_native.patched_code(), ms_native.wave64, ms_native.vgprs).unwrap();
+        let mst = structure::structure(&mp).unwrap();
+        let mres = resource::track(&mp, &ms_native.layout, ms_native.stage, Some(&mst)).unwrap();
+        let mio = io::raise(&mp, &ms_native).unwrap();
+        let ms_in = EmitInput {
+            c: &mc,
+            native: &ms_native,
+            p: &mp,
+            st: &mst,
+            io: &mio,
+            res: &mres,
+        };
+        // Standalone emission stays over 32 KiB (68 * 4 * 128 = 34,816 B).
+        let standalone = emit_pruned(&ms_in, Options::default(), None).unwrap();
+        assert_eq!(mesh_bytes(&standalone.dxil), Some(34_816));
+        assert!(mesh_bytes(&standalone.dxil).unwrap() > METAL_MESH_OUTPUT_BYTES);
+
+        // Depth-only linking (no pixel shader) drops all arbitrary outputs.
+        let empty = lower::KeptOutputs::new();
+        let depth_ms = emit_pruned(&ms_in, Options::default(), Some(&empty)).unwrap();
+        assert_eq!(mesh_bytes(&depth_ms.dxil), Some(4 * 4 * 128));
+
+        // Paired pixel shader declaring the same 17 rows, reading only
+        // TEXCOORD0.xy and TEXCOORD15.zw.
+        let p1 = |vdst: u32, attr: u32, ch: u32| {
+            0xC800_0000u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let p2 = |vdst: u32, attr: u32, ch: u32| {
+            0xC801_0001u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let ps_words = [
+            p1(2, 0, 0),
+            p2(2, 0, 0), // v2 = TEXCOORD0.x (1.0)
+            p1(3, 0, 1),
+            p2(3, 0, 1), // v3 = TEXCOORD0.y (0.5)
+            p1(4, 15, 2),
+            p2(4, 15, 2), // v4 = TEXCOORD15.z (0.25)
+            p1(5, 15, 3),
+            p2(5, 15, 3), // v5 = TEXCOORD15.w (1.0)
+            0xF800_180F,
+            0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let ps_inputs: Vec<crate::native::PsInput> = (0..16u8)
+            .map(|k| crate::native::PsInput {
+                usage: crate::native::Usage::Generic,
+                row: k + 1,
+                mask: 0xF,
+                attr: k,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            })
+            .collect();
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: ps_inputs,
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut ps_sig = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }];
+        for k in 0..16u32 {
+            ps_sig.push(SigElement {
+                name: "TEXCOORD".into(),
+                index: k,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(k + 1),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            });
+        }
+        let isg1 = container::signature(&ps_sig, true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let ps_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let pc = Container::parse(&ps_bytes).unwrap();
+        let pp = ir::build(&ps_native.patched_code(), ps_native.wave64, ps_native.vgprs).unwrap();
+        let pst = structure::structure(&pp).unwrap();
+        let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).unwrap();
+        let pio = io::raise(&pp, &ps_native).unwrap();
+        let ps_in = EmitInput {
+            c: &pc,
+            native: &ps_native,
+            p: &pp,
+            st: &pst,
+            io: &pio,
+            res: &pres,
+        };
+        let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
+        let reads = pixel_input_reads(&full_ps.dxil).unwrap();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads.get(&("TEXCOORD".into(), 0)), Some(&0b0011));
+        assert_eq!(reads.get(&("TEXCOORD".into(), 15)), Some(&0b1100));
+
+        let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
+        let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
+        // SV_Position (4) + TEXCOORD0.xy (2) + TEXCOORD15.zw (2) = 8 components.
+        assert_eq!(mesh_bytes(&linked_ms.dxil), Some(8 * 4 * 128));
+        assert!(!linked_ps.dxil.is_empty());
+
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut depth_ms.dxil.clone()).unwrap();
+                v.validate(&mut linked_ms.dxil.clone()).unwrap();
+                v.validate(&mut linked_ps.dxil.clone()).unwrap();
+            }
+            use super::host::{Draw, Host, Root};
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+                D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+                D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {label} device; skipped");
+                    continue;
+                };
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+                // SAFETY: the query writes the structure of the given size.
+                let queried = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS7,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                };
+                if queried.is_err()
+                    || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+                {
+                    eprintln!("no mesh shaders on the {label} device; skipped");
+                    continue;
+                }
+                let root = host
+                    .root_signature_for(&[
+                        (&linked_ms, D3D12_SHADER_VISIBILITY_MESH),
+                        (&linked_ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                    ])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &linked_ms.dxil, &linked_ps.dxil)
+                    .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![
+                                (0, Root::Constants(vec![0])),
+                                (1, Root::Constants(vec![0])),
+                            ],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                assert!(
+                    texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                    "{label}: unexpected pixel {:?}",
+                    texels.first()
+                );
+            }
+        }
     }
 }
